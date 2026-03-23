@@ -1,27 +1,11 @@
-Part 1 — Deploy the Three-Tier App
-Step 1 — Create the Kind Cluster
-bash# Clone the repo
-git clone https://github.com/mandhar-patil/mandhar-three-tier-project.git
-cd mandhar-three-tier-project
-
-# Create the cluster
-kind create cluster --name mandhar-cluster --config kind-cluster.yaml
-
-# Verify nodes are Ready
-kubectl get nodes
-Expected output:
-NAME                            STATUS   ROLES
-mandhar-cluster-control-plane   Ready    control-plane
-mandhar-cluster-worker          Ready    <none>
-mandhar-cluster-worker2         Ready    <none>
-
-Step 2 — Create Namespace
+📦 Part 1 — Application Deployment
+Step 1 — Create Namespace
 bashkubectl create namespace three-tier
 kubectl config set-context --current --namespace=three-tier
 
-Step 3 — Apply Secrets
+Step 2 — Apply Secrets
 
-⚠️ Open secrets.yaml and update the username, password, and connection string before applying.
+⚠️ Open secrets.yaml before applying and update the username, password, and connection string with your own values.
 
 bashkubectl apply -f secrets.yaml
 
@@ -29,81 +13,82 @@ bashkubectl apply -f secrets.yaml
 kubectl get secrets -n three-tier
 
 💡 Why mongodb-service:27017 in the connection string?
-Kubernetes automatically gives every Service a DNS name inside the cluster.
-The backend connects to mongodb-service:27017 and Kubernetes resolves it to the correct pod — no hardcoded IPs needed.
+Inside Kubernetes, every Service gets a DNS name automatically. The backend connects to mongodb-service:27017 and Kubernetes resolves it to the correct MongoDB pod — no hardcoded IPs needed.
 
 MongoDB connection string format:
 mongodb://USERNAME:PASSWORD@SERVICE-NAME:PORT/DB-NAME?authSource=admin
 
 # Example:
-mongodb://admin:mypassword@mongodb-service:27017/taskdb?authSource=admin
+mongodb://admin:mypassword@mongodb-service:27017/mydb?authSource=admin
 
-Step 4 — Deploy MongoDB
+Step 3 — Deploy MongoDB
 bashkubectl apply -f mongodb.yaml
 
-# Watch until mongodb-0 shows Running before proceeding
+# Watch until mongodb-0 shows Running
 kubectl get pods -n three-tier -w
 
-MongoDB uses a StatefulSet (not a Deployment) because it needs a stable identity and persistent storage. The service is headless (clusterIP: None) which is required for StatefulSets to work correctly.
+⏳ Wait until mongodb-0 is in Running state before moving to the next step.
 
 
-Step 5 — Deploy Backend
+Step 4 — Deploy Backend
 
-💡 Your Node.js app must read the connection string from the environment variable MONGO_CONN_STR.
-Make sure your code uses: mongoose.connect(process.env.MONGO_CONN_STR)
+💡 Your Node.js backend must use mongoose.connect(process.env.MONGO_URI) to read the connection string from the environment.
 
 bashkubectl apply -f backend.yaml
 
-# Verify backend pod is Running
+# Verify pod and service
 kubectl get pods -n three-tier
 kubectl get svc -n three-tier
 
-Step 6 — Deploy Frontend
+Step 5 — Deploy Frontend
 
-⚠️ Open frontend.yaml and replace the REACT_APP_BACKEND_URL value with your actual server IP before applying.
+⚠️ Open frontend.yaml and replace the REACT_APP_BACKEND_URL value and the image name with your own values before applying.
 
 bashkubectl apply -f frontend.yaml
 
-# Or update the env variable after applying (replace with your IP)
+# Update the backend URL with your actual server IP
 kubectl set env deployment/frontend \
   REACT_APP_BACKEND_URL=http://<YOUR-SERVER-IP>:3500/api/tasks \
   -n three-tier
-To access locally via port-forward:
-bashkubectl port-forward service/frontend-service 3000:3000 -n three-tier --address=0.0.0.0 &
-kubectl port-forward service/backend-service  3500:3500 -n three-tier --address=0.0.0.0 &
-Then open: http://localhost:3000
 
-Part 2 — Istio Service Mesh
+# Port-forward to access locally
+kubectl port-forward service/frontend-service -n three-tier 3000:3000 --address=0.0.0.0 &
+kubectl port-forward service/backend-service  -n three-tier 3500:3500 --address=0.0.0.0 &
+Open the app at: http://<YOUR-SERVER-IP>:3000
 
-💡 What is Istio?
-Istio is a service mesh — a network layer that sits between all your pods and controls how they talk to each other.
-It automatically injects a small Envoy proxy sidecar into every pod, so every request passes through Envoy before reaching the app container.
-
+🕸️ Part 2 — Istio Service Mesh
+What is Istio?
+Istio is a service mesh — it sits between all your pods and controls how they communicate. It automatically injects a small Envoy proxy sidecar into every pod, so every request passes through Envoy first.
 Without Istio:
-  [frontend pod]  ──────────────────>  [backend pod]
+  [frontend pod]  ──────────────────▶  [backend pod]
 
 With Istio:
-  [frontend pod + envoy]  ──────>  [backend pod + envoy]
+  [frontend pod + envoy]  ──────────▶  [backend pod + envoy]
 Traffic flow with Istio:
 Browser :8080
     │
     ▼
-Istio IngressGateway (NodePort)
+Istio IngressGateway (NodePort/LoadBalancer)
     │
     ▼
 Istio Gateway resource
     │
     ▼
 Istio VirtualService
-    ├──> /api  ──>  backend-service:3500
-    └──> /     ──>  frontend-service:3000
+    │               │
+    ▼               ▼
+frontend:3000   backend:3500
+                    │
+                    ▼
+              mongodb:27017
 
-✅ Complete Part 1 Steps 1–6 and have all pods running before starting Part 2.
+✅ Complete Part 1 Steps 1–5 first before proceeding with Istio.
 
 
 Step 1 — Install istioctl
 bashcurl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.21.0 sh -
 
+# Add to PATH
 cd istio-1.21.0
 export PATH=$PWD/bin:$PATH
 
@@ -117,59 +102,52 @@ istioctl version
 Step 2 — Install Istio on the Cluster
 bashistioctl install --set profile=demo -y
 
-# Verify istiod and ingressgateway pods are Running
+# Verify Istio pods are running
 kubectl get pods -n istio-system
-ProfileUse caseminimalCore only, no ingress gatewaydemoAll features enabled — best for learning ✅productionTuned for real workloads
+You should see istiod and istio-ingressgateway pods running.
+ProfileDescriptionminimalCore only, no ingress gatewaydemoEverything enabled — best for learning ✅productionOptimized for real workloads
 
 Step 3 — Enable Sidecar Injection
-bash# Label the namespace — Istio will auto-inject Envoy into every new pod
+bash# Label the namespace — Istio will auto-inject Envoy into every pod
 kubectl label namespace three-tier istio-injection=enabled
 
-# Confirm label was applied
+# Verify the label was applied
 kubectl get ns three-tier --show-labels
 
-After labeling, every pod in this namespace gets 2 containers automatically — your app + an Envoy sidecar. No YAML changes needed; Istio handles it via a webhook.
+💡 After labeling, every new pod in this namespace will automatically get 2 containers: your app + Envoy proxy. No YAML changes needed — Istio handles it via a webhook.
 
 
 Step 4 — Restart Deployments
-Restart all workloads so the Envoy sidecar gets injected into already-running pods.
-bashkubectl rollout restart statefulset mongodb    -n three-tier
-kubectl rollout restart deployment  backend    -n three-tier
-kubectl rollout restart deployment  frontend   -n three-tier
+Restart existing pods so the Envoy sidecar gets injected into them.
+bashkubectl rollout restart statefulset mongodb -n three-tier
+kubectl rollout restart deployment backend -n three-tier
+kubectl rollout restart deployment frontend -n three-tier
 
-# Confirm 2/2 READY — that means app + envoy are both running
+# Verify — look for 2/2 under READY column
 kubectl get pods -n three-tier
 Expected output:
 NAME                    READY   STATUS
-backend-xxxxx           2/2     Running    <- Node.js app + Envoy
-frontend-xxxxx          2/2     Running    <- React app + Envoy
-mongodb-0               2/2     Running    <- MongoDB + Envoy
+backend-xxxxx           2/2     Running   ← app + envoy
+frontend-xxxxx          2/2     Running   ← app + envoy
+mongodb-0               2/2     Running   ← app + envoy
 
-Step 5 — Apply Istio Gateway
-The Gateway resource configures the IngressGateway pod to listen on port 80 and accept incoming HTTP traffic.
-Without it, traffic reaches the IngressGateway pod but gets rejected — it has no instructions.
+💡 2/2 instead of 1/1 confirms Envoy was successfully injected.
+
+
+Step 5 — Apply Gateway and VirtualService
 bashkubectl apply -f istio-gateway.yaml
 
-# Verify Gateway is created
+# Verify both resources were created
 kubectl get gateway -n three-tier
-
-💬 Think of the Gateway as a bouncer at a club entrance — it decides which port, protocol, and domains are allowed in. Nothing gets through without it.
-
-
-Step 6 — Apply VirtualService
-The VirtualService contains the routing rules — it looks at the URL path and sends traffic to the right service.
-bashkubectl apply -f istio-gateway.yaml   # same file contains both Gateway + VirtualService
-
-# Verify VirtualService is created
 kubectl get virtualservice -n three-tier
-Routing rules:
-PathRoutes to/api/*backend-service:3500/frontend-service:3000
+How routing works:
+URL PathRoutes To/api/*backend-service:3500/frontend-service:3000
 
-💬 Think of the VirtualService as the receptionist inside — once the bouncer (Gateway) lets you in, the receptionist reads your URL and sends you to the right room.
+💡 Think of the Gateway as a bouncer at the entrance — it controls which port and protocol is allowed in. The VirtualService is the receptionist inside — it looks at your URL path and routes you to the correct service.
 
 
-Step 7 — Patch IngressGateway NodePort
-Map the Istio IngressGateway to NodePort 30080 so your host machine can reach it on port 8080.
+Step 6 — Patch IngressGateway NodePort
+Map the Istio IngressGateway to NodePort 30080 so traffic from your host reaches it.
 bashkubectl patch svc istio-ingressgateway -n istio-system --type='json' -p='[
   {"op":"replace","path":"/spec/ports/1/nodePort","value":30080}
 ]'
@@ -177,63 +155,50 @@ bashkubectl patch svc istio-ingressgateway -n istio-system --type='json' -p='[
 # Verify the NodePort is set
 kubectl get svc istio-ingressgateway -n istio-system
 
-☁️ On AWS or any cloud provider: Change the service type to LoadBalancer instead of using NodePort.
+☁️ On AWS or any cloud provider: Switch the service type to LoadBalancer instead of patching the NodePort.
 
 
-Step 8 — Update Frontend Backend URL
-With Istio, all traffic goes through the IngressGateway on port 8080.
-Update the frontend so it calls the backend through Istio instead of directly.
-bash# Change port 3500 → 8080 (traffic now goes through Istio)
-kubectl set env deployment/frontend \
+Step 7 — Update Frontend Backend URL
+With Istio, all traffic goes through the IngressGateway on port 8080. Update the frontend to use that port instead of 3500.
+bashkubectl set env deployment/frontend \
   REACT_APP_BACKEND_URL=http://<YOUR-SERVER-IP>:8080/api/tasks \
   -n three-tier
 
-The frontend calls <ip>:8080/api/tasks → Istio VirtualService routes /api → backend-service:3500.
-The backend port is no longer exposed directly.
+The frontend now calls :8080/api/tasks → Istio VirtualService routes /api → backend-service:3500. The backend port is no longer exposed directly.
 
 
-Access the Application
-Via Port-Forward (quickest, no ingress needed)
+🌐 Access the Application
+Via Port-Forward (no ingress needed)
 bashkubectl port-forward service/frontend-service 3000:3000 -n three-tier --address=0.0.0.0 &
 kubectl port-forward service/backend-service  3500:3500 -n three-tier --address=0.0.0.0 &
 Open: http://localhost:3000
 Via Istio IngressGateway
-WhatURLFrontendhttp://<your-server-ip>:8080Backend APIhttp://<your-server-ip>:8080/api/tasks
+URLFrontendhttp://<YOUR-SERVER-IP>:8080Backend APIhttp://<YOUR-SERVER-IP>:8080/api/tasks
 
-Cleanup
-bash# Remove all app resources
-kubectl delete namespace three-tier
+🔍 Troubleshooting
+Check pod status and events
+bashkubectl get pods -n three-tier
+kubectl describe pod <pod-name> -n three-tier
+View pod logs
+bash# Single container pod
+kubectl logs <pod-name> -n three-tier
 
-# Delete the Kind cluster
-kind delete cluster --name mandhar-cluster
-
-Troubleshooting
-Pods stuck in Pending
-bashkubectl describe pod <pod-name> -n three-tier
-# Read the Events section at the bottom for the root cause
-MongoDB CrashLoopBackOff or connection refused
-bash# Check if secret key names match what the YAML expects
+# Pod with Istio sidecar (2 containers)
+kubectl logs <pod-name> -c <container-name> -n three-tier
+MongoDB connection errors
+bash# Check if secret keys match exactly what the app expects
 kubectl get secret mongo-secret -n three-tier -o yaml
-
-# Check MongoDB logs
-kubectl logs mongodb-0 -n three-tier
-Sidecar not injected — pods still show 1/1 after Istio setup
-bash# Confirm the label exists
+Sidecar not injected (still 1/1 after Istio setup)
+bash# Confirm label exists on namespace
 kubectl get ns three-tier --show-labels
 
 # Re-run rollout restarts
 kubectl rollout restart statefulset mongodb -n three-tier
 kubectl rollout restart deployment backend frontend -n three-tier
-Istio IngressGateway returns 404 or connection refused
-bash# Confirm NodePort is 30080
+Istio IngressGateway not reachable
+bash# Confirm NodePort is set to 30080
 kubectl get svc istio-ingressgateway -n istio-system
 
-# Check Gateway and VirtualService exist in the right namespace
-kubectl get gateway,virtualservice -n three-tier
-View logs for any pod
-bash# Single container pod
-kubectl logs <pod-name> -n three-tier
-
-# Multi-container pod (Istio injected)
-kubectl logs <pod-name> -n three-tier -c backend    # app container
-kubectl logs <pod-name> -n three-tier -c istio-proxy  # envoy container
+🧹 Cleanup
+bash# Remove all app resources
+kubectl delete namespace three-tier

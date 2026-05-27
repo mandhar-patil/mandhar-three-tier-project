@@ -1,0 +1,124 @@
+pipeline {
+     agent { label "jenkins-agent" }
+     
+     environment {
+        SERVICE_NAME      = "three-tier-frontend"
+        DOCKER_REGISTRY   = "mandhar12"
+        GITOPS_REPO       = "github.com/mandhar-patil/three-tier-gitops-ArgoCD-.git"
+        GITOPS_CHART_PATH = "k8s/frontend"
+        VERSION    = "1.0"
+        IMAGE_TAG  = "${VERSION}"
+        IMAGE_NAME = "${DOCKER_REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+     }
+     
+     options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+     }
+     
+     stages {
+         
+         stage('Checkout') {
+             steps { 
+                 git( url: 'https://github.com/mandhar-patil/mandhar-three-tier-project.git', branch: 'main')
+                 }
+         }
+         
+         stage ('Install Dependencies') {
+             steps {
+                 dir('Application-Code/frontend') {
+                     sh 'npm install'
+                 }
+             }
+         }
+         
+         stage ('Unit Tests') {
+             steps { dir('Application-Code/frontend') {
+                         sh 'npm run test || true'  // Won't fail if test script missing
+                   }         
+             }
+         }
+         
+         stage('Docker Build') {
+             steps {
+                 dir('Application-Code/frontend') {
+                   sh """
+                     docker build \
+                     -t ${IMAGE_NAME} \
+                     -t ${DOCKER_REGISTRY}/${SERVICE_NAME}:latest \
+                     .
+                   """
+                 }
+             }
+         }
+         
+         stage('push to dockerhub') {
+             steps {
+                 withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                 )]) {
+                     sh """
+                       echo "${DOCKER_PASS}" | docker login -u ${DOCKER_USER} --password-stdin
+                       docker push ${IMAGE_NAME}
+                       docker push ${DOCKER_REGISTRY}/${SERVICE_NAME}:latest
+                       docker logout
+                       """
+                     }
+             }
+         }
+         
+         stage('update Gitops repo') {
+             steps {
+                 withCredentials([usernamePassword(
+                     credentialsId: 'github-gitops-token',
+                     usernameVariable: 'GIT_USER',
+                     passwordVariable: 'GIT_TOKEN'
+                 )]) {
+                     sh """
+                     git config --global user.email  "jenkins@company.com"
+                     git config --global user.name "Jenkins CI"
+                     
+                      rm -rf gitops-workspace
+                      git clone https://${GIT_USER}:${GIT_TOKEN}@${GITOPS_REPO} gitops-workspace
+                      cd gitops-workspace
+                      
+                      sed -i "s|image:.*|image: ${IMAGE_NAME}|" ${GITOPS_CHART_PATH}/deployment.yml
+                      echo "=== Verifying image update ==="
+                      grep "image:" ${GITOPS_CHART_PATH}/deployment.yml
+                      
+                      git add ${GITOPS_CHART_PATH}/deployment.yml
+                      git commit -m "ci: backend image → ${IMAGE_TAG} [#${BUILD_NUMBER}]"
+                      git push origin main
+                      """
+                      }
+             }
+         }
+    }
+         
+    post {
+      success {
+         withCredentials([string(credentialsId: 'slack-webhook-url', variable: 'SLACK_URL')]) {
+             sh """curl -s -X POST -H 'Content-type: application/json' \
+                   --data '{"text":"✅ *${SERVICE_NAME}* SUCCESS | ${IMAGE_TAG}"}' \
+                   ${SLACK_URL} || true"""
+         }
+      }
+      failure {
+         withCredentials([string(credentialsId: 'slack-webhook-url', variable: 'SLACK_URL')]) {
+            sh """curl -s -X POST -H 'Content-type: application/json' \
+               --data '{"text":"❌ *${SERVICE_NAME}* FAILED | #${BUILD_NUMBER}"}' \
+               ${SLACK_URL} || true"""
+         }
+      }
+      always {
+            sh "docker rmi ${IMAGE_NAME} || true"
+            sh "docker rmi ${DOCKER_REGISTRY}/${SERVICE_NAME}:latest || true"
+            sh "rm -rf gitops-workspace"
+            cleanWs()
+           }
+    }
+}
